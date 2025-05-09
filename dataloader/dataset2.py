@@ -51,12 +51,13 @@ def get_collate_class(name):
     assert name in REGISTERED_COLATE_CLASSES, f"available class: {REGISTERED_COLATE_CLASSES}"
     return REGISTERED_COLATE_CLASSES[name]
 
-"""
-{'car': 0, 'bicycle': 1, 'motorcycle': 2, 'truck': 3, 'other-vehicle': 4, 'person': 5, 'bicyclist': 6, 'motorcyclist': 7, 
-'road': 8, 'parking': 9, 'sidewalk': 10, 'other-ground': 11, 'building': 12, 'fence': 13, 'vegetation': 14, 'trunk': 15, 
-'terrain': 16, 'pole': 17, 'traffic-sign': 18}
-"""
-instance_classes = [1, 2, 3, 4, 5, 6, 7, 8] # [2, 3, 4, 5, 7, 8, 10, 13, 14, 17, 20] #
+# """
+# {'car': 0, 'bicycle': 1, 'motorcycle': 2, 'truck': 3, 'other-vehicle': 4, 'person': 5, 'bicyclist': 6, 'motorcyclist': 7, 
+# 'road': 8, 'parking': 9, 'sidewalk': 10, 'other-ground': 11, 'building': 12, 'fence': 13, 'vegetation': 14, 'trunk': 15, 
+# 'terrain': 16, 'pole': 17, 'traffic-sign': 18}
+# """
+# instance_classes = [1, 2, 3, 4, 5, 6, 7, 8] # [2, 3, 4, 5, 7, 8, 10, 13, 14, 17, 20] #
+instance_classes = [1] # New obstacle label ID is 1.
 Omega = [np.random.random() * np.pi * 2 / 3, (np.random.random() + 1) * np.pi * 2 / 3]  # x3
 
 @register_dataset

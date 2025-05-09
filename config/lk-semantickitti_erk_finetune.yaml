@@ -17,7 +17,7 @@ model_params:
     # - 8
     # - 16
   hiden_size: 8
-  num_classes: 20
+  num_classes: 2
   large_kernel_size:
     - 3 # TODO: was 9, maybe set to 3
     - 3
@@ -37,9 +37,9 @@ dataset_params:
   dataset_type: "point_semkitti_mix"
   pc_dataset_type: "SemKITTI_sk"
   collate_type: "mix_collate_fn_default"
-  ignore_label: 0
+  ignore_label: 255
   label_mapping: "./config/label_mapping/semantic-kitti-sub.yaml"
-  num_classes: 20
+  num_classes: 2
 
   spatial_shape:
     - 2000
@@ -55,26 +55,28 @@ dataset_params:
     - -50
     - -4
   seg_labelweights:
-    - 0
-    - 55437630
-    - 320797
-    - 541736
-    - 2578735
-    - 3274484
-    - 552662
-    - 184064
-    - 78858
-    - 240942562
-    - 17294618
-    - 170599734
-    - 6369672
-    - 230413074
-    - 101130274
-    - 476491114
-    - 9833174
-    - 129609852
-    - 4506626
-    - 1168181
+    # TODO check if sum below adds up - 0
+    # TODO check if sum below adds up - 55437630
+    # TODO check if sum below adds up - 320797
+    # TODO check if sum below adds up - 541736
+    # TODO check if sum below adds up - 2578735
+    # TODO check if sum below adds up - 3274484
+    # TODO check if sum below adds up - 552662
+    # TODO check if sum below adds up - 184064
+    # TODO check if sum below adds up - 78858
+    # TODO check if sum below adds up - 240942562
+    # TODO check if sum below adds up - 17294618
+    # TODO check if sum below adds up - 170599734
+    # TODO check if sum below adds up - 6369672
+    # TODO check if sum below adds up - 230413074
+    # TODO check if sum below adds up - 101130274
+    # TODO check if sum below adds up - 476491114
+    # TODO check if sum below adds up - 9833174
+    # TODO check if sum below adds up - 129609852
+    # TODO check if sum below adds up - 4506626
+    # TODO check if sum below adds up - 1168181
+    - 564816438 # Sum of original counts for classes [9,10,11,12,17]
+    - 886511409 # Sum of original counts for classes [1-8,13-16,18,19]
 
   train_data_loader:
     data_path: "./dataset/SemanticKitti/sequences/"

@@ -64,11 +64,24 @@ class SemKITTI_sk(data.Dataset):
             sem_data = np.vectorize(self.learning_map.__getitem__)(sem_data)
             inst_data = annotated_data >> 16
 
-        origin_len = len(xyz)
+        # origin_len = len(xyz)
+
+        # Ground classes: 9 (road), 10 (parking), 11 (sidewalk), 12 (other-ground), 17 (terrain)
+        # Obstacle classes: 1-8, 13, 14, 15, 16, 18, 19
+        # Ignore: 0 (unlabeled)
+        new_labels_mapped = np.full_like(sem_data, 255, dtype=np.uint8)
+
+        ground_classes = [9, 10, 11, 12, 17]
+        for cls_idx in ground_classes:
+            new_labels_mapped[sem_data == cls_idx] = 0
+        
+        obstacle_classes = [1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 18, 19]
+        for cls_idx in obstacle_classes:
+            new_labels_mapped[sem_data == cls_idx] = 1
 
         data_dict = {}
         data_dict['xyz'] = xyz
-        data_dict['labels'] = sem_data.astype(np.uint8)
+        data_dict['labels'] = new_labels_mapped.astype(np.uint8)
         data_dict['instance_label'] = inst_data
         data_dict['signal'] = feat
         data_dict['origin_len'] = origin_len

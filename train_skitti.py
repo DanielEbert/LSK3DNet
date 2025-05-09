@@ -12,7 +12,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel 
 
 from tqdm import tqdm
-from utils.metric_util import per_class_iu, fast_hist_crop
+from utils.metric_util import per_class_iu, fast_hist_crop, fast_hist
 from dataloader.pc_dataset import get_SemKITTI_label_name
 from builder import data_builder, loss_builder, optim_builder
 from network.largekernel_model import get_model_class
@@ -91,9 +91,12 @@ def main_worker(local_rank, nprocs, configs):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    SemKITTI_label_name = get_SemKITTI_label_name(dataset_config["label_mapping"])
-    unique_label = np.asarray(sorted(list(SemKITTI_label_name.keys())))[1:] - 1
-    unique_label_str = [SemKITTI_label_name[x] for x in unique_label + 1]
+    # SemKITTI_label_name = get_SemKITTI_label_name(dataset_config["label_mapping"])
+    # unique_label = np.asarray(sorted(list(SemKITTI_label_name.keys())))[1:] - 1
+    # unique_label_str = [SemKITTI_label_name[x] for x in unique_label + 1]
+
+    binary_label_name = {0: 'ground', 1: 'obstacle'}
+    unique_label_str = [binary_label_name[x] for x in sorted(binary_label_name.keys())]
 
     my_model = get_model_class(model_config['model_architecture'])(configs)
 
@@ -187,7 +190,8 @@ def main_worker(local_rank, nprocs, configs):
                         predict_labels = torch.argmax(val_data_dict['logits'], dim=1)
                         predict_labels = predict_labels.cpu().detach().numpy()
                         val_pt_labs = val_data_dict['labels'].cpu().detach().numpy()
-                        hist_list.append(fast_hist_crop(predict_labels, val_pt_labs, unique_label))
+                        # hist_list.append(fast_hist_crop(predict_labels, val_pt_labs, unique_label))
+                        hist_list.append(fast_hist(predict_labels, val_pt_labs, dataset_config.num_classes))
 
                 if train_hypers.local_rank == 0:
                     print('inference speed:', total_time / 4071)

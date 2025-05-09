@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 import yaml
 from utils.load_util import load_yaml
-from utils.metric_util import per_class_iu, fast_hist_crop
+from utils.metric_util import per_class_iu, fast_hist_crop, fast_hist
 from dataloader.pc_dataset import get_SemKITTI_label_name, get_pc_model_class
 from dataloader.dataset2 import get_dataset_class, get_collate_class
 from network.largekernel_model import get_model_class
@@ -106,9 +106,11 @@ def main_worker(local_rank, nprocs, configs):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    SemKITTI_label_name = get_SemKITTI_label_name(dataset_config["label_mapping"])
-    unique_label = np.asarray(sorted(list(SemKITTI_label_name.keys())))[1:] - 1
-    unique_label_str = [SemKITTI_label_name[x] for x in unique_label + 1]
+    # SemKITTI_label_name = get_SemKITTI_label_name(dataset_config["label_mapping"])
+    # unique_label = np.asarray(sorted(list(SemKITTI_label_name.keys())))[1:] - 1
+    # unique_label_str = [SemKITTI_label_name[x] for x in unique_label + 1]
+    binary_label_name = {0: "ground", 1: "obstacle"}
+    unique_label_str = [binary_label_name[x] for x in sorted(binary_label_name.keys())]
 
     my_model = get_model_class(model_config['model_architecture'])(configs)
 
@@ -136,10 +138,10 @@ def main_worker(local_rank, nprocs, configs):
 
     label_mapping = dataset_config["label_mapping"]
 
-    with open(dataset_config['label_mapping'], 'r') as stream:
-        mapfile = yaml.safe_load(stream)
+    # with open(dataset_config['label_mapping'], 'r') as stream:
+    #     mapfile = yaml.safe_load(stream)
 
-    valid_labels = np.vectorize(mapfile['learning_map_inv'].__getitem__)
+    # valid_labels = np.vectorize(mapfile['learning_map_inv'].__getitem__)
 
     SemKITTI = get_pc_model_class(dataset_config['pc_dataset_type'])
 
@@ -209,7 +211,8 @@ def main_worker(local_rank, nprocs, configs):
                 val_pt_labs = raw_labels.cpu().detach().numpy()
 
                 if train_hypers.local_rank == 0:
-                    hist_list.append(fast_hist_crop(predict_labels, val_pt_labs, unique_label))
+                    # hist_list.append(fast_hist_crop(predict_labels, val_pt_labs, unique_label))
+                    hist_list.append(fast_hist(predict_labels, val_pt_labs, model_config.num_classes))
                     pbar.update(1)
 
         if train_hypers.local_rank == 0:
@@ -266,15 +269,18 @@ def main_worker(local_rank, nprocs, configs):
                         print('%s already exsist...' % (new_save_dir))
                         pass
 
-                    test_pred_label = valid_labels(test_pred_label)                    
-                    test_pred_label = test_pred_label.astype(np.uint32)
-                    test_pred_label.tofile(new_save_dir)
+                    # test_pred_label = valid_labels(test_pred_label)                    
+                    # test_pred_label = test_pred_label.astype(np.uint32)
+                    # test_pred_label.tofile(new_save_dir)
+                    test_pred_label_save = test_pred_label_save.astype(np.uint8)
+                    test_pred_label_save.tofile(new_save_dir)
                     pbar.update(1)
 
         if train_hypers.local_rank == 0:
             pbar.close()
             # print('Predicted test labels are saved in %s. Need to be shifted to original label format before submitting to the Competition website.' % exp_dir)
             # print('Remapping script can be found in semantic-kitti-api.')
+            print(f'Predicted binary (0:ground, 1:obstacle) test labels are saved in {exp_dir}')
 
 if __name__ == '__main__':
     print(' '.join(sys.argv))
