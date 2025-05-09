@@ -149,7 +149,7 @@ def main_worker(local_rank, nprocs, configs):
         
     while epoch < train_hypers['max_num_epochs']:
         loss_list = []
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         my_model.train()
         if train_hypers.local_rank == 0:
             pbar = tqdm(total=len(train_dataset_loader), ncols=80)
@@ -157,10 +157,10 @@ def main_worker(local_rank, nprocs, configs):
         else:
             pbar = None
         train_sampler.set_epoch(epoch)
-        time.sleep(10)
+        # time.sleep(10)
         # for i in range(5):
         for i_iter, (train_data_dict) in enumerate(train_dataset_loader):
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
             if global_iter % check_iter == 0 and global_iter != 0: 
                 my_model.eval()
                 hist_list = []
@@ -169,6 +169,9 @@ def main_worker(local_rank, nprocs, configs):
                 with torch.no_grad():
                     for i_iter_val, (val_data_dict) in enumerate(
                             val_dataset_loader):
+                        
+                        if i_iter_val > 30:
+                            break
 
                         val_data_dict['points'] = val_data_dict['points'].to(pytorch_device)
                         val_data_dict['normal'] = val_data_dict['normal'].to(pytorch_device)
@@ -218,7 +221,7 @@ def main_worker(local_rank, nprocs, configs):
 
                 my_model.train()
                 torch.cuda.empty_cache()
-                time.sleep(10)
+                # time.sleep(10)
                 if train_hypers['distributed']:
                     dist.barrier()
                 loss_list = []

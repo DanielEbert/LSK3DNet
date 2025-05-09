@@ -55,6 +55,9 @@ elif configs.num_vote == 1:
     configs['dataset_params']['val_data_loader']["scale_aug"] = False
     configs['dataset_params']['val_data_loader']["transform_aug"] = False
 
+configs['dataset_params']['val_data_loader']["batch_size"] = 1
+configs['dataset_params']['val_data_loader']["num_workers"] = 4
+
 exp_dir_root = configs['model_params']['model_load_path'].split('/')
 exp_dir_root = exp_dir_root[0] if len(exp_dir_root) > 1 else ''
 exp_dir = './'+ exp_dir_root +'/'
@@ -175,6 +178,9 @@ def main_worker(local_rank, nprocs, configs):
         with torch.no_grad():
             for i_iter_val, (val_data_dict) in enumerate(val_dataset_loader):
                 print(i_iter_val, train_hypers.local_rank,val_data_dict['path'])
+
+                if i_iter_val > 200:
+                    break
                     
                 torch.cuda.empty_cache()
                 raw_labels = val_data_dict['raw_labels'].to(pytorch_device)

@@ -73,9 +73,9 @@ class Compose(object):
         self.cfg = cfg if cfg is not None else []
         self.transforms = []
 
-        if self.cfg['SphereCrop']:
+        if 'SphereCrop' in self.cfg and self.cfg['SphereCrop']:
             self.transforms.append(SphereCrop(point_max=self.cfg['d_point_num'], mode="random"))
-        if self.cfg['ShufflePoint']:
+        if 'ShufflePoint' in self.cfg and self.cfg['ShufflePoint']:
             self.transforms.append(ShufflePoint())
 
     def __call__(self, data_dict):

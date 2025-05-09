@@ -14,21 +14,21 @@ model_params:
   scale_list:
     - 2
     - 4
-    - 8
-    - 16
-  hiden_size:  64
+    # - 8
+    # - 16
+  hiden_size: 8
   num_classes: 20
   large_kernel_size:
-    - 9
-    - 9
-    - 9
+    - 3 # TODO: was 9, maybe set to 3
+    - 3
+    - 3
   spatial_group_partition:
     - 0
     - 3
     - 6
     - 9
-  model_load_path: 'output_skitti/opensource_9ks_s030_w64_0.pt'
-  model_save_path: 'output_skitti/opensource_9ks_s030_w64_.pt'
+  model_load_path: "output_skitti/opensource_9ks_s030_w64_0.pt"
+  model_save_path: "output_skitti/opensource_9ks_s030_w64_.pt"
 
 ###################
 ## Dataset options
@@ -79,23 +79,23 @@ dataset_params:
   train_data_loader:
     data_path: "./dataset/SemanticKitti/sequences/"
     imageset: "train"
-    batch_size:  20
-    num_workers: 20
-    rotate_aug: True
-    flip_aug: True
-    scale_aug: True
-    transform_aug: True
-    dropout_aug: True
+    batch_size: 6
+    num_workers: 6
+    rotate_aug: False
+    flip_aug: False
+    scale_aug: False
+    transform_aug: False
+    dropout_aug: False
     polarmix_aug: False
-    mix_aug: True
+    mix_aug: False
     instance_aug: False
     d_point_num: 80000
 
   val_data_loader:
     data_path: "./dataset/SemanticKitti/sequences/"
-    num_workers: 8
+    num_workers: 12
     imageset: "val"
-    batch_size: 8
+    batch_size: 12
     rotate_aug: False
     flip_aug: False
     scale_aug: False
@@ -105,22 +105,21 @@ dataset_params:
     mix_aug: False
     d_point_num: -1
 
-
 ###################
 ## Train params
 train_params:
   seed: 1588147245
   max_num_epochs: 30
-  learning_rate: 0.0002
-  optimizer: SGD # [SGD, Adam, AdamW]
-  lr_scheduler: StepLR  # [StepLR, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts]
+  learning_rate: 0.002
+  optimizer: AdamW # [SGD, Adam, AdamW]
+  lr_scheduler: StepLR # [StepLR, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts]
   momentum: 0.9
   weight_decay: 1.0e-4
   nesterov: True
   lambda_lovasz: 1
   decay_step: 1
   decay_rate: 0.5
-  eval_every_n_steps: 299 #683 #597 #1195
+  eval_every_n_steps: 200 # 99 #683 #597 #1195
   distributed: False
   amp_enabled: False
 
@@ -128,11 +127,11 @@ train_params:
 ## Sparse params
 sparse_params:
   use_sparse: True
-  growth: 'random'
-  prune: 'magnitude'
-  redistribution: 'none'
+  growth: "random"
+  prune: "magnitude"
+  redistribution: "none"
   prune_rate: 0.3
   sparsity: 0.3
-  sparse_init: 'ERK'
+  sparse_init: "ERK"
   update_frequency: 8000
   stop_sparse_epoch: 0
