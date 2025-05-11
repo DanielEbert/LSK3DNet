@@ -34,8 +34,8 @@ def build(dataset_config, train_config):
         loader_config=val_dataloader_config
     )
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=train_config.world_size,
-                                                                   rank=train_config.local_rank, shuffle=True)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=train_config.world_size if 'world_size' in train_config else 1,
+                                                                   rank=train_config.local_rank if 'local_rank' in train_config else 0, shuffle=True)
 
     train_dataset_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                                     batch_size=train_dataloader_config["batch_size"],

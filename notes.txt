@@ -1,0 +1,2 @@
+on larger models, use higher virtual batch size because we spent so much time in backtrack i think that may help
+models use old model as baseline, for fair comparison maybe start empty

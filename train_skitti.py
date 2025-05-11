@@ -7,13 +7,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda import amp
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel 
+import spconv.pytorch as spconv
 
 from tqdm import tqdm
-from utils.metric_util import per_class_iu, fast_hist_crop, fast_hist
-from dataloader.pc_dataset import get_SemKITTI_label_name
+from utils.metric_util import per_class_iu, fast_hist
 from builder import data_builder, loss_builder, optim_builder
 from network.largekernel_model import get_model_class
 from easydict import EasyDict
@@ -23,299 +20,366 @@ from utils.load_util import load_yaml
 from utils.load_save_util import load_checkpoint_old, load_checkpoint_model_mask
 from utils.erk_sparse_core import Masking, CosineDecay
 
-
 import warnings
 warnings.filterwarnings("ignore")
 
-parser = argparse.ArgumentParser(description='')
-parser.add_argument('--config_path', default='./config/lk-semantickitti_erk_finetune.yaml')
-parser.add_argument('--ip', default='127.0.0.1', type=str)
-parser.add_argument('--port', default='3020', type=str)
-args = parser.parse_args()
-config_path = args.config_path
-configs = load_yaml(config_path)
-configs.update(vars(args))  # override the configuration using the value in args
-configs = EasyDict(configs)
+def setup_env_and_configs():
+    parser = argparse.ArgumentParser(description='Single GPU Training Script for SemanticKITTI')
+    parser.add_argument('--config_path', default='./config/lk-semantickitti_erk_finetune.yaml',
+                        help='Path to the configuration YAML file.')
+    parser.add_argument('--load_weights', action='store_true', help='Initialize model weights and biases from previous model')
+    args = parser.parse_args()
 
-exp_dir_root = configs['model_params']['model_save_path'].split('/')
-exp_dir_root = exp_dir_root[0] if len(exp_dir_root) > 1 else ''
-exp_dir = './'+exp_dir_root+'/'
-if not os.path.exists(exp_dir):
-    os.makedirs(exp_dir)
-shutil.copy('train_skitti.py', str(exp_dir))
-shutil.copy('dataloader/dataset2.py', str(exp_dir))
-shutil.copy('dataloader/pc_dataset.py', str(exp_dir))
-shutil.copy('dataloader/utils.py', str(exp_dir))
-shutil.copy('builder/data_builder.py', str(exp_dir))
-shutil.copy('network/largekernel_model.py', str(exp_dir))
-shutil.copy('utils/erk_sparse_core.py', str(exp_dir))
-shutil.copy('config/lk-semantickitti_erk_finetune.yaml', str(exp_dir))
+    configs = EasyDict(load_yaml(args.config_path))
+    configs.update(vars(args))
+
+    model_save_path = configs['model_params']['model_save_path']
+    # Use dirname of the model save path for exp_dir if it's a path, else use current dir's subfolder
+    if os.path.dirname(model_save_path):
+        # TODO: maybe use original code
+        exp_dir = os.path.dirname(model_save_path)
+        path_parts = model_save_path.split('/')
+        exp_code_backup_root = path_parts[0] if len(path_parts) > 1 else 'experiments'
+        exp_code_backup_dir = os.path.join('.', exp_code_backup_root)
+    else: # model_save_path is just a filename
+        exp_dir = '.'
+        exp_code_backup_dir = os.path.join('.', 'experiments', os.path.splitext(model_save_path)[0])
+
+    os.makedirs(exp_dir, exist_ok=True)
+    os.makedirs(exp_code_backup_dir, exist_ok=True)
+
+    files_to_copy = [
+        __file__,
+        'dataloader/dataset2.py',
+        'dataloader/pc_dataset.py',
+        'dataloader/utils.py',
+        'builder/data_builder.py',
+        'network/largekernel_model.py',
+        'utils/erk_sparse_core.py',
+        args.config_path
+    ]
+    print(f"Backing up code to: {exp_code_backup_dir}")
+    for f_path in files_to_copy:
+        if os.path.exists(f_path):
+            try:
+                shutil.copy(f_path, exp_code_backup_dir)
+            except shutil.SameFileError:
+                pass # Source and destination are the same
+            except Exception as e:
+                print(f"Warning: Could not copy {f_path} to {exp_code_backup_dir}: {e}")
+        else:
+            print(f"Warning: File {f_path} not found for backup.")
+
+    return configs, exp_dir
 
 
-def main(configs):
-    configs.nprocs = torch.cuda.device_count()
-    configs.train_params.distributed = True if configs.nprocs > 1 else False
-    if configs.train_params.distributed:
-        mp.spawn(main_worker, nprocs=configs.nprocs, args=(configs.nprocs, configs))
-    else:
-        main_worker(0, 1, configs)
+def reinitialize_model_weights(model, leaky_relu_slope=0.1, check_coverage=True):
+    """
+    Re-initializes model weights and biases to common good defaults.
+    - Kaiming Normal for Conv/Linear/SubMConv3d weights.
+    - Zeros for Conv/Linear/SubMConv3d biases (if they exist).
+    - Ones for BatchNorm/LayerNorm weights, Zeros for their biases.
 
-def main_worker(local_rank, nprocs, configs):
+    Args:
+        model (nn.Module): The model to re-initialize.
+        leaky_relu_slope (float): Slope for LeakyReLU for Kaiming init.
+        check_coverage (bool): If True, prints a report of modules with parameters
+                               that were not explicitly handled by an init rule.
+    """
+    print("Applying custom re-initialization to model parameters...")
+
+    parameter_holding_module_names = set()
+    initialized_module_names = set()
+
+    if check_coverage:
+        for name, m_check in model.named_modules():
+            # Check if the module m_check itself has parameters (not its children)
+            # and if any of them require gradients.
+            if any(p.requires_grad for p in m_check.parameters(recurse=False)):
+                parameter_holding_module_names.add(name)
+
+    for name, m in model.named_modules():
+        was_initialized = False
+        if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear, spconv.SubMConv3d)):
+            if hasattr(m, 'weight') and m.weight is not None and m.weight.requires_grad:
+                nn.init.kaiming_normal_(m.weight, a=leaky_relu_slope, mode='fan_in', nonlinearity='leaky_relu')
+                was_initialized = True
+            if hasattr(m, 'bias') and m.bias is not None and m.bias.requires_grad:
+                nn.init.constant_(m.bias, 0)
+                was_initialized = True
+
+        elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm)):
+            if hasattr(m, 'weight') and m.weight is not None and m.weight.requires_grad:
+                nn.init.constant_(m.weight, 1)
+                was_initialized = True
+            if hasattr(m, 'bias') and m.bias is not None and m.bias.requires_grad:
+                nn.init.constant_(m.bias, 0)
+                was_initialized = True
+
+        elif isinstance(m, nn.Embedding):
+            if m.weight.requires_grad:
+                nn.init.normal_(m.weight, mean=0, std=0.02)
+                was_initialized = True
+
+        if was_initialized and name in parameter_holding_module_names:
+            initialized_module_names.add(name)
+
+    if check_coverage:
+        unhandled_modules = parameter_holding_module_names - initialized_module_names
+
+        if unhandled_modules:
+            print("WARNING: The following modules with trainable parameters were NOT explicitly handled by an initialization rule:")
+            for name in sorted(list(unhandled_modules)):
+                module_ptr = model
+                for part in name.split('.'):
+                    if part:
+                        module_ptr = getattr(module_ptr, part)
+                print(f"  - Name: '{name}', Type: {type(module_ptr).__name__}")
+
+
+def train(configs, exp_dir):
     torch.autograd.set_detect_anomaly(True)
 
     dataset_config = configs['dataset_params']
     model_config = configs['model_params']
     train_hypers = configs['train_params']
     sparse_config = configs['sparse_params']
-    train_hypers.local_rank = local_rank
-    train_hypers.world_size = nprocs
-    configs.train_params.world_size = nprocs
-    
-    if train_hypers['distributed']:
-        init_method = 'tcp://' + args.ip + ':' + args.port
-        dist.init_process_group(backend='nccl', init_method=init_method, world_size=nprocs, rank=local_rank)
-        dataset_config.train_data_loader.batch_size = dataset_config.train_data_loader.batch_size // nprocs
 
-    pytorch_device = torch.device('cuda:' + str(local_rank))
-    torch.backends.cudnn.benchmark = True
-    torch.cuda.set_device(local_rank)
+    if torch.cuda.is_available():
+        pytorch_device = torch.device('cuda:0')
+        torch.backends.cudnn.benchmark = True
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        pytorch_device = torch.device('cpu')
+        print("CUDA not available, running on CPU.")
 
-
-    # seed
-    if ('seed' not in train_hypers) or (train_hypers.seed is None):
-        train_hypers.seed = torch.initial_seed() % (2 ** 32 - 1)
-
-    seed = train_hypers.seed + local_rank * dataset_config.train_data_loader.num_workers * train_hypers['max_num_epochs']
+    # Seed everything
+    seed = train_hypers.get('seed', random.randint(0, 2**32 - 1))
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-    # SemKITTI_label_name = get_SemKITTI_label_name(dataset_config["label_mapping"])
-    # unique_label = np.asarray(sorted(list(SemKITTI_label_name.keys())))[1:] - 1
-    # unique_label_str = [SemKITTI_label_name[x] for x in unique_label + 1]
+    if pytorch_device.type == 'cuda':
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    print(f"Using seed: {seed}")
 
     binary_label_name = {0: 'ground', 1: 'obstacle'}
     unique_label_str = [binary_label_name[x] for x in sorted(binary_label_name.keys())]
+    num_classes = dataset_config.get('num_classes', len(unique_label_str))
 
     my_model = get_model_class(model_config['model_architecture'])(configs)
 
-    if train_hypers['distributed']:
-        my_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(my_model)
-
-    if os.path.exists(model_config['model_load_path']):
-        print('pre-train')
+    pre_weight = None # For sparse mask initialization
+    if model_config.get('model_load_path') and os.path.exists(model_config['model_load_path']):
+        print(f"Loading pre-trained weights from: {model_config['model_load_path']}")
         try:
             my_model, pre_weight = load_checkpoint_model_mask(model_config['model_load_path'], my_model, pytorch_device)
-        except:
-            my_model = load_checkpoint_old(model_config['model_load_path'], my_model)
+        except Exception as e_mask:
+            print(f"Failed to load checkpoint with mask: {e_mask}. Trying old method.")
+            try:
+                my_model = load_checkpoint_old(model_config['model_load_path'], my_model)
+            except Exception as e_old:
+                print(f"Failed to load checkpoint with old method: {e_old}. Starting from scratch.")
+
+    if not configs.load_weights:
+        reinitialize_model_weights(my_model, leaky_relu_slope=0.1)
 
     my_model.to(pytorch_device)
 
-    if train_hypers['distributed']:
-        train_hypers.local_rank = train_hypers.local_rank % torch.cuda.device_count()
-        my_model= DistributedDataParallel(my_model,device_ids=[train_hypers.local_rank],find_unused_parameters=False)
+    train_hypers.distributed = False
+    train_dataset_loader, val_dataset_loader, _ = data_builder.build(dataset_config, train_hypers)
 
-    train_dataset_loader, val_dataset_loader, train_sampler = data_builder.build(dataset_config, train_hypers)
+    configs.train_params.total_steps = train_hypers['max_num_epochs'] * len(train_dataset_loader)
+    print(f"Total training steps: {configs.train_params.total_steps}, Batches per epoch: {len(train_dataset_loader)}")
+    sparse_config['stop_sparse_epoch'] = sparse_config['stop_sparse_epoch'] * len(train_dataset_loader)
 
-    configs.train_params.total_steps = train_hypers['max_num_epochs'] * len(train_dataset_loader) 
-    print(len(train_dataset_loader))
-    sparse_config['stop_sparse_epoch'] = sparse_config['stop_sparse_epoch'] * len(train_dataset_loader) 
     optimizer, scheduler = optim_builder.build(configs, my_model)
     criterion = loss_builder.criterion(configs, pytorch_device)
-    scaler = amp.GradScaler(enabled=train_hypers['amp_enabled']) 
+    scaler = amp.GradScaler(enabled=train_hypers['amp_enabled'])
 
+    mask_object = None
     if sparse_config['use_sparse']:
         decay = CosineDecay(sparse_config['prune_rate'], int(configs.train_params.total_steps))
-        mask = Masking(optimizer, scaler, 
-                       spatial_partition = model_config['spatial_group_partition'],
-                       prune_mode=sparse_config['prune'], prune_rate_decay=decay, 
-                       growth_mode=sparse_config['growth'], redistribution_mode=sparse_config['redistribution'], 
-                       fp16=train_hypers['amp_enabled'], update_frequency=sparse_config['update_frequency'], 
-                       sparsity=sparse_config['sparsity'], sparse_init=sparse_config['sparse_init'], 
-                       device=train_hypers.local_rank, distributed=train_hypers['distributed'], stop_iter = sparse_config['stop_sparse_epoch'])
+        mask_object = Masking(optimizer, scaler, # Pass the main optimizer and scaler
+                       spatial_partition=model_config['spatial_group_partition'],
+                       prune_mode=sparse_config['prune'], prune_rate_decay=decay,
+                       growth_mode=sparse_config['growth'], redistribution_mode=sparse_config['redistribution'],
+                       fp16=train_hypers['amp_enabled'], update_frequency=sparse_config['update_frequency'],
+                       sparsity=sparse_config['sparsity'], sparse_init=sparse_config['sparse_init'],
+                       device=pytorch_device, distributed=False,
+                       stop_iter=sparse_config['stop_sparse_epoch'])
         try:
-            mask.add_module(my_model, pre_weight)
-        except:
-            mask.add_module(my_model)
+            mask_object.add_module(my_model, pre_weight)
+        except Exception as e_add_module: # Catch specific errors if possible
+            print(f"Masking.add_module failed (possibly pre_weight issue): {e_add_module}. Adding module without pre_weight.")
+            mask_object.add_module(my_model)
 
-
-    # training
-    epoch = 0
-    best_val_miou = 0
-    my_model.train()
+    best_val_miou = 0.0
     global_iter = 0
-    check_iter = train_hypers['eval_every_n_steps']
-    train_sampler.set_epoch(0)
-    sche_epoch_update = True
+    eval_every_n_steps = train_hypers['eval_every_n_steps']
+    # sche_epoch_update is True if scheduler is an epoch-wise scheduler (e.g. StepLR, MultiStepLR)
+    # False if it's a step-wise scheduler (e.g. CosineAnnealingLR, OneCycleLR)
+    # This info should ideally come from optim_builder or config. Assuming it's step-wise if not specified.
+    sche_epoch_update = configs.train_params.get('scheduler_update_per_epoch', True)
 
-        
-    while epoch < train_hypers['max_num_epochs']:
-        loss_list = []
-        # torch.cuda.empty_cache()
+    for epoch in range(train_hypers['max_num_epochs']):
         my_model.train()
-        if train_hypers.local_rank == 0:
-            pbar = tqdm(total=len(train_dataset_loader), ncols=80)
-            pbar.set_description('Epoch %i' % epoch)
-        else:
-            pbar = None
-        train_sampler.set_epoch(epoch)
-        # time.sleep(10)
-        # for i in range(5):
-        for i_iter, (train_data_dict) in enumerate(train_dataset_loader):
-            # torch.cuda.empty_cache()
-            if global_iter % check_iter == 0 and global_iter != 0: 
+        epoch_loss_list = []
+        
+        progress_bar = tqdm(total=len(train_dataset_loader), ncols=100,
+                            desc=f'Epoch {epoch}/{train_hypers["max_num_epochs"]-1}')
+
+        for i_iter, train_data_dict in enumerate(train_dataset_loader):
+            # --- Evaluation Block ---
+            if global_iter > 0 and global_iter % eval_every_n_steps == 0:
                 my_model.eval()
                 hist_list = []
-                val_loss_list = []
-                total_time = 0
+                total_inference_time = 0.0
+                num_val_batches_processed = 0
+                print(f"\nRunning validation at global_iter {global_iter}...")
                 with torch.no_grad():
-                    for i_iter_val, (val_data_dict) in enumerate(
-                            val_dataset_loader):
-                        
-                        if i_iter_val > 30:
+                    for i_iter_val, val_data_dict in enumerate(val_dataset_loader):
+                        if i_iter_val > 300: # Limit validation batches as in original
+                            print(f"Validation limited to first {i_iter_val} batches.")
                             break
-
-                        val_data_dict['points'] = val_data_dict['points'].to(pytorch_device)
-                        val_data_dict['normal'] = val_data_dict['normal'].to(pytorch_device)
-                        val_data_dict['batch_idx'] = val_data_dict['batch_idx'].to(pytorch_device)
-                        val_data_dict['labels'] = val_data_dict['labels'].to(pytorch_device)
-                    
-                        torch.cuda.synchronize()
-                        start = time.time()
+                        num_val_batches_processed += 1
+                        for key in val_data_dict:
+                            if isinstance(val_data_dict[key], torch.Tensor):
+                                val_data_dict[key] = val_data_dict[key].to(pytorch_device)
+                        
+                        if pytorch_device.type == 'cuda': torch.cuda.synchronize()
+                        start_time = time.time()
                         val_data_dict = my_model(val_data_dict)
-                        torch.cuda.synchronize()
-                        end = time.time()
-                        total_time += (end-start)
-                        predict_labels = torch.argmax(val_data_dict['logits'], dim=1)
-                        predict_labels = predict_labels.cpu().detach().numpy()
-                        val_pt_labs = val_data_dict['labels'].cpu().detach().numpy()
-                        # hist_list.append(fast_hist_crop(predict_labels, val_pt_labs, unique_label))
-                        hist_list.append(fast_hist(predict_labels, val_pt_labs, dataset_config.num_classes))
+                        if pytorch_device.type == 'cuda': torch.cuda.synchronize()
+                        end_time = time.time()
+                        total_inference_time += (end_time - start_time)
 
-                if train_hypers.local_rank == 0:
-                    print('inference speed:', total_time / 4071)
+                        predict_labels = torch.argmax(val_data_dict['logits'], dim=1).cpu().numpy()
+                        val_pt_labs = val_data_dict['labels'].cpu().numpy()
+                        hist_list.append(fast_hist(predict_labels, val_pt_labs, num_classes))
+                
+                if num_val_batches_processed > 0:
+                    avg_inf_time = total_inference_time / num_val_batches_processed
+                    print(f'Avg. val inference time per batch: {avg_inf_time:.4f} s ({num_val_batches_processed} batches)')
+                
+                if hist_list:
                     iou = per_class_iu(sum(hist_list))
                     print('Validation per class iou: ')
-                    for class_name, class_iou in zip(unique_label_str, iou):
-                        print('%s : %.2f%%' % (class_name, class_iou * 100))
+                    for class_name, class_iou_val in zip(unique_label_str, iou):
+                        print(f'  {class_name} : {class_iou_val * 100:.2f}%')
                     val_miou = np.nanmean(iou) * 100
 
                     if best_val_miou < val_miou:
                         best_val_miou = val_miou
-
-                        try: # with nn.DataParallel() the net is added as a submodule of DataParallel
-                            if sparse_config['use_sparse']:
-                                save_dict = {'checkpoint':my_model.module.state_dict(),'mask':mask.masks}
-                            else:
-                                save_dict = {'checkpoint':my_model.module.state_dict()}
-                        except:
-                            if sparse_config['use_sparse']:
-                                save_dict = {'checkpoint':my_model.state_dict(),'mask':mask.masks}
-                            else:
-                                save_dict = {'checkpoint':my_model.state_dict()}
-
-                        torch.save(save_dict, model_config['model_save_path'][:-3] + str(train_hypers.local_rank)+ model_config['model_save_path'][-3:],
-                                _use_new_zipfile_serialization=False)
+                        save_dict = {'checkpoint': my_model.state_dict()}
+                        if sparse_config['use_sparse'] and mask_object:
+                            save_dict['mask'] = mask_object.masks
                         
-                        print('Saved: ' + model_config['model_save_path'][:-3] + str(train_hypers.local_rank)+ model_config['model_save_path'][-3:])
-
-                    print('Current val miou is %.3f while the best val miou is %.3f' %
-                        (val_miou, best_val_miou))                
+                        current_save_path = model_config['model_save_path']
+                        torch.save(save_dict, current_save_path, _use_new_zipfile_serialization=False)
+                        print(f'Best model saved to: {current_save_path} (mIoU: {best_val_miou:.3f}%)')
+                    
+                    print(f'Current val mIoU: {val_miou:.3f} | Best val mIoU: {best_val_miou:.3f}')
+                else:
+                    print("No validation batches processed or hist_list empty.")
 
                 my_model.train()
-                torch.cuda.empty_cache()
-                # time.sleep(10)
-                if train_hypers['distributed']:
-                    dist.barrier()
-                loss_list = []
+                if pytorch_device.type == 'cuda': torch.cuda.empty_cache()
+                epoch_loss_list = [] # Reset loss list after eval
 
-            train_data_dict['points'] = train_data_dict['points'].to(pytorch_device)
-            train_data_dict['normal'] = train_data_dict['normal'].to(pytorch_device)
-            train_data_dict['batch_idx'] = train_data_dict['batch_idx'].to(pytorch_device)
-            train_data_dict['labels'] = train_data_dict['labels'].to(pytorch_device)
-                
+            # --- Training Step ---
+            for key in train_data_dict:
+                if isinstance(train_data_dict[key], torch.Tensor):
+                    train_data_dict[key] = train_data_dict[key].to(pytorch_device)
+            
+            optimizer.zero_grad(set_to_none=True)
+
             with amp.autocast(enabled=train_hypers['amp_enabled']):
-                # forward + backward + optimize
                 train_data_dict = my_model(train_data_dict)
                 loss = criterion(train_data_dict)
 
-            loss_list.append(loss.item())
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                print(f"NaN or Inf loss detected: {loss.item()}. Skipping step.")
+                if global_iter % eval_every_n_steps == 0 and epoch_loss_list:
+                    print(f'Epoch {epoch}, Iter {i_iter}, Avg Loss before skip: {np.mean(epoch_loss_list):.3f}')
+                progress_bar.update(1)
+                global_iter += 1
+                continue
 
-            if sparse_config['use_sparse']:
-                if train_hypers['amp_enabled']:
-                    mask.optimizer.zero_grad()
-                    with torch.autograd.detect_anomaly():
-                        mask.scaler.scale(loss).backward()
-                    mask.scaler.unscale_(mask.optimizer)
-                    torch.nn.utils.clip_grad_norm_(parameters=my_model.parameters(), max_norm=0.1)
-                    mask.scaler.step(mask.optimizer)
-                    mask.step()
-                    mask.scaler.update()
-                    scale = mask.scaler.get_scale()
-                    skip_lr_sched = (scale != mask.scaler.get_scale())
-                    if not skip_lr_sched:
-                        scheduler.step()
-                else:
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(parameters=my_model.parameters(), max_norm=0.25)
-                    mask.step()
-                    if not sche_epoch_update:
-                        scheduler.step()
-            else:
+
+            epoch_loss_list.append(loss.item())
+            optimizer_step_skipped = False
+
+            if sparse_config['use_sparse'] and mask_object:
+                clip_max_norm = 0.1 if train_hypers['amp_enabled'] else 0.25
                 if train_hypers['amp_enabled']:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(parameters=my_model.parameters(), max_norm=0.25)
+                    torch.nn.utils.clip_grad_norm_(my_model.parameters(), max_norm=clip_max_norm)
+                    
+                    prev_scale = scaler.get_scale()
                     scaler.step(optimizer)
+                    mask_object.step()
                     scaler.update()
-                    scale = scaler.get_scale()
-                    skip_lr_sched = (scale != scaler.get_scale())
-                    if not skip_lr_sched:
-                        scheduler.step()
-                else:
-                    optimizer.zero_grad()
+                    new_scale = scaler.get_scale()
+                    optimizer_step_skipped = (new_scale < prev_scale)
+                else: # Sparse, No AMP
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(parameters=my_model.parameters(), max_norm=0.25)
-                    optimizer.step()    
+                    torch.nn.utils.clip_grad_norm_(my_model.parameters(), max_norm=clip_max_norm)
+                    mask_object.step() # This includes optimizer.step() and mask updates
+            else: # Not Sparse
+                clip_max_norm = 0.25 # Same for AMP and No-AMP in non-sparse original
+                if train_hypers['amp_enabled']:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(my_model.parameters(), max_norm=clip_max_norm)
+
+                    prev_scale = scaler.get_scale()
+                    scaler.step(optimizer) # Optimizer step
+                    scaler.update()
+                    new_scale = scaler.get_scale()
+                    optimizer_step_skipped = (new_scale < prev_scale)
+                else: # Not Sparse, No AMP
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(my_model.parameters(), max_norm=clip_max_norm)
+                    optimizer.step()
+            
+            if not sche_epoch_update: # If step-wise scheduler
+                if not optimizer_step_skipped:
                     scheduler.step()
+                # else:
+                #     print(f"LR scheduler step skipped at iter {global_iter} due to optimizer step skip.")
 
-            if torch.isnan(loss).any():
-                # continue
-                for name, param in my_model.named_parameters():
-                    if param.grad is not None and torch.isnan(param.grad).any():
-                        print("nan gradient found")
-                        print("name:", name)
-                quit()
-
-            if train_hypers.local_rank == 0:
-                pbar.set_postfix({'loss':'{0:1.2f}'.format(loss.item()), 'lr':'{0:1.8f}'.format(optimizer.param_groups[0]['lr'])})
-                pbar.update(1)
-
+            progress_bar.set_postfix({'loss': f'{loss.item():.4f}',
+                                      'lr': f'{optimizer.param_groups[0]["lr"]:.1e}',
+                                      'best_val_miou': f'{best_val_miou:.2f}'})
+            progress_bar.update(1)
             global_iter += 1
-            if train_hypers.local_rank == 0:
 
-                if global_iter % check_iter == 0:
-                    if len(loss_list) > 0:
-                        print('epoch %d iter %5d, loss: %.3f\n' %
-                            (epoch, i_iter, np.mean(loss_list)))
-                    else:
-                        print('loss error')
+            # Log accumulated loss at interval if not eval iteration
+            if global_iter % eval_every_n_steps == 0 and i_iter +1 < len(train_dataset_loader) : # Avoid double log if eval also logs
+                if epoch_loss_list:
+                    print(f'\nEpoch {epoch}, Iter {i_iter}, Avg Train Loss: {np.mean(epoch_loss_list):.3f}')
+                # epoch_loss_list = [] # Reset here if logging mid-epoch, or after eval
 
-            if global_iter % check_iter == 0:
-                loss_list = []
-
-        if sche_epoch_update:
+        if sche_epoch_update: # If epoch-wise scheduler
             scheduler.step()
 
-        torch.cuda.empty_cache()
-        if train_hypers.local_rank == 0:
-            pbar.close()
-        epoch += 1
-    
+        if pytorch_device.type == 'cuda': torch.cuda.empty_cache()
+        progress_bar.close()
+        if epoch_loss_list: # Log final epoch avg loss
+            print(f"End of Epoch {epoch}, Avg Train Loss: {np.mean(epoch_loss_list):.3f}, LR: {optimizer.param_groups[0]['lr']:.1e}")
+
+    print(f"Training finished. Best validation mIoU: {best_val_miou:.3f}")
+    print(f"Final model saved at: {model_config['model_save_path']}")
+
 
 if __name__ == '__main__':
-    print(' '.join(sys.argv))
-    print(configs)
-    main(configs)
+    loaded_configs, experiment_directory = setup_env_and_configs()
+    print("Effective configurations:")
+    for key, value in loaded_configs.items():
+        print(f"  {key}: {value}")
+    print(f"Experiment directory for model: {experiment_directory}")
+    
+    train(loaded_configs, experiment_directory)
+
