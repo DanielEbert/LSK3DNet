@@ -352,7 +352,7 @@ def train(configs, exp_dir):
 
             progress_bar.set_postfix({'loss': f'{loss.item():.4f}',
                                       'lr': f'{optimizer.param_groups[0]["lr"]:.1e}',
-                                      'best_val_miou': f'{best_val_miou:.2f}'})
+                                      'best_val_miou': f'{best_val_miou:.4f}'})
             progress_bar.update(1)
             global_iter += 1
 
